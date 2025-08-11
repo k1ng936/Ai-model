@@ -1,5 +1,2 @@
-fastapi
+flask
 uvicorn
-autogen-agentchat
-autogen-ext[openai]
-requests
