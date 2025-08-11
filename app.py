@@ -1,24 +1,34 @@
-import os, re, json, base64, pathlib, time
+import os
+import re
+import json
+import base64
+import pathlib
+import time
 from typing import Dict, Any, List
+
 from fastapi import FastAPI, Query, Body, HTTPException
+from fastapi.responses import HTMLResponse
+
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 import requests
 
 app = FastAPI(title="AutoGen Builder")
 
-# ====== Config ======
+# ========= Config =========
 MODEL_NAME = os.getenv("AUTOGEN_MODEL", "gpt-4o-mini")
 WORKSPACE_ROOT = pathlib.Path(os.getenv("WORKSPACE_ROOT", "/workspace")).resolve()
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
-# GitHub (optional)
+# GitHub (optional push target)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-TARGET_REPO  = os.getenv("TARGET_REPO", "")  # e.g. "yourname/yourrepo"
+TARGET_REPO = os.getenv("TARGET_REPO", "")      # e.g. "yourname/yourrepo"
 TARGET_BRANCH = os.getenv("TARGET_BRANCH", "main")
 TARGET_DIR = os.getenv("TARGET_DIR", "autogen-output")  # subfolder in repo
 
-# ====== AutoGen Agent ======
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# ========= AutoGen Agent =========
 model = OpenAIChatCompletionClient(model=MODEL_NAME)
 assistant = AssistantAgent(
     "builder",
@@ -27,20 +37,20 @@ assistant = AssistantAgent(
         "You are a senior software engineer. "
         "When asked to 'build' an app, respond ONLY with a single JSON object in this schema:\n"
         "{\n"
-        '  "files": [{"path": "relative/path.ext", "content": "file content as UTF-8 text"}],\n'
-        '  "instructions": "how to run",\n'
-        '  "postbuild": ["optional shell commands"]\n'
+        '  \"files\": [{\"path\": \"relative/path.ext\", \"content\": \"file content as UTF-8 text\"}],\n'
+        '  \"instructions\": \"how to run\",\n'
+        '  \"postbuild\": [\"optional shell commands\"]\n'
         "}\n"
         "Do not include commentary. If the request is unclear, choose sensible defaults and still return valid JSON. "
         "Keep paths POSIX-style. Avoid huge binaries; use placeholders where needed."
     ),
 )
 
-# ====== Helpers ======
+# ========= Helpers =========
 JSON_BLOCK = re.compile(r"```json\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
 
 def extract_json_manifest(text: str) -> Dict[str, Any]:
-    """Find a JSON code block or last JSON-looking object."""
+    """Find a JSON code block or use the last JSON-looking object."""
     m = JSON_BLOCK.search(text)
     raw = m.group(1) if m else text.strip()
     try:
@@ -69,7 +79,7 @@ def github_put_file(repo: str, branch: str, path_in_repo: str, content_text: str
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
     }
-    # Get existing SHA if file exists
+    # get existing sha if file exists
     sha = None
     r = requests.get(url, headers=headers, params={"ref": branch})
     if r.status_code == 200:
@@ -95,36 +105,97 @@ def push_folder_to_github(local_base: pathlib.Path, repo: str, branch: str, targ
         dest = f"{target_dir}/{rel}".strip("/")
         github_put_file(repo, branch, dest, p.read_text(encoding="utf-8"), token, message)
 
-# ====== Endpoints ======
-@app.get("/")
+# ========= UI / Health =========
+@app.get("/health")
 def health():
     return {"status": "ok", "workspace": str(WORKSPACE_ROOT)}
 
+@app.get("/", response_class=HTMLResponse)
+def ui():
+    # minimal mobile-friendly UI
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoGen Builder</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    textarea { width: 100%; height: 140px; }
+    button { padding: 10px 14px; margin-right: 8px; margin-top: 8px; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#f6f6f6; padding:10px; border-radius:6px; }
+    .hint { color:#555; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h2>AutoGen Builder</h2>
+  <p class="hint">Type what you want (e.g., “Build a FastAPI TODO API with SQLite”).</p>
+  <textarea id="text" placeholder="Your goal or question..."></textarea>
+  <div>
+    <button onclick="ask()">Ask Agent</button>
+    <button onclick="build()">Build App</button>
+  </div>
+  <pre id="out">Ready.</pre>
+
+<script>
+async function ask(){
+  const t = document.getElementById('text').value.trim();
+  if(!t){ alert('Type something first'); return; }
+  document.getElementById('out').textContent = 'Asking...';
+  const r = await fetch('/agent?task=' + encodeURIComponent(t));
+  const j = await r.json();
+  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+}
+async function build(){
+  const t = document.getElementById('text').value.trim();
+  if(!t){ alert('Type a build goal first'); return; }
+  document.getElementById('out').textContent = 'Building... (this can take a bit)';
+  const r = await fetch('/build', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({goal: t})
+  });
+  const j = await r.json();
+  document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+}
+</script>
+</body>
+</html>
+"""
+
+# ========= Endpoints =========
 @app.get("/agent")
 async def agent(task: str = Query(..., description="What you want AutoGen to do")):
-    res = await assistant.on_messages([{"role": "user", "content": task}])
+    if not OPENAI_API_KEY:
+        return {"error": "OPENAI_API_KEY not set in environment"}
+    res = await assistant.on_messages(
+        [{"role": "user", "content": task}],
+        cancellation_token=None
+    )
     return {"task": task, "reply": res.messages[-1]["content"]}
 
 @app.post("/build")
-async def build(
-    body: Dict[str, Any] = Body(
-        ..., example={"goal": "Build a simple TODO web app with FastAPI and SQLite"}
-    )
-):
+async def build(body: Dict[str, Any] = Body(..., example={"goal": "Build a FastAPI + SQLite TODO API with CRUD"})):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set in environment")
+
     goal = body.get("goal")
     if not goal:
         raise HTTPException(status_code=400, detail="Missing 'goal' field.")
+
     session_id = f"proj-{int(time.time())}"
     base = (WORKSPACE_ROOT / session_id)
     base.mkdir(parents=True, exist_ok=True)
 
-    # Ask AutoGen to produce the manifest JSON
     prompt = (
         f"Goal: {goal}\n"
         "Output only the JSON manifest as described in your system message. "
         "Keep it reasonably small and runnable. Include a README.md in files."
     )
-    res = await assistant.on_messages([{"role": "user", "content": prompt}])
+    res = await assistant.on_messages(
+        [{"role": "user", "content": prompt}],
+        cancellation_token=None
+    )
     text = res.messages[-1]["content"]
 
     manifest = extract_json_manifest(text)
@@ -134,7 +205,7 @@ async def build(
 
     written = write_files(base, files)
 
-    # Optionally push to GitHub
+    # Optional GitHub push
     pushed = False
     pushed_count = 0
     if GITHUB_TOKEN and TARGET_REPO:
