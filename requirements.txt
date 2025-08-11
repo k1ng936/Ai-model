@@ -2,3 +2,4 @@ fastapi
 uvicorn
 autogen-agentchat
 autogen-ext[openai]
+requests
