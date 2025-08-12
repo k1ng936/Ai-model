@@ -1,2 +1,2 @@
-flask
-uvicorn
+flask==2.3.3
+openai==1.12.0
